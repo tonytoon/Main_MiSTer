@@ -41,6 +41,8 @@ char joy_bnames[NUMBUTTONS][32] = {};
 int  joy_bcount = 0;
 static struct pollfd pool[NUMDEV + 3];
 
+extern VideoInfo *pcurrent_video_info;
+
 static int ev2amiga[] =
 {
 	NONE, //0   KEY_RESERVED
@@ -1082,6 +1084,39 @@ static int ev2archie[] =
 	NONE  //255 ???
 };
 
+static bool autofire_cfg_parsed = false;
+static int af_rate[NUMPLAYERS];
+static int num_af_rates = 0;
+static int af_pattern[5];
+static int af_length[5];
+static float af_hz[5];
+
+void parse_autofire_cfg() {
+  char *token;
+  int count = 0;
+  char cfg_string[256] = {};
+  snprintf (cfg_string, sizeof (cfg_string) - 1, "%s", cfg.autofire_rates); // make sure cfg_string remains null-terminated
+  token = strtok(cfg_string, ",");
+  while (token != NULL && count < 5) {
+    af_hz[count++] = strtof(token, NULL);
+    token = strtok(NULL, ",");
+  }
+  num_af_rates = count;
+
+  for (int i = 0; i != num_af_rates; i++) {
+    af_length[i] = (int)lround(60 / af_hz[i]); // get the period
+    int on_frames = af_length[i] / 2;
+    for (int j = 0; j != on_frames; j++) {
+      af_pattern[i] |= (1u << j);
+    }
+  }
+
+  for (int i = 0; i != NUMPLAYERS; i++) {
+    af_rate[i] = cfg.autofire_rate_default;
+  }
+  autofire_cfg_parsed = true;
+}
+
 uint8_t ps2_kbd_scan_set = 2;
 uint32_t get_ps2_code(uint16_t key)
 {
@@ -1648,7 +1683,6 @@ static int kbd_toggle = 0;
 static uint64_t joy[NUMPLAYERS] = {};		// 0-31 primary mappings, 32-64 alternate
 static uint64_t autofire[NUMPLAYERS] = {};	// 0-31 primary mappings, 32-64 alternate
 static uint32_t autofirecodes[NUMPLAYERS][BTN_NUM] = {};
-static int af_delay[NUMPLAYERS] = {};
 
 static uint32_t crtgun_timeout[NUMDEV] = {};
 
@@ -1891,40 +1925,39 @@ static void joy_digital(int jnum, uint64_t mask, uint32_t code, char press, int 
 						
 						autofire[num] = !found ? autofire[num] | lastmask[num] : autofire[num] & ~lastmask[num];
 
-						if (hasAPI1_5())
-						{
-							if (!found) sprintf(str, "Auto fire: %dms (%uhz)", af_delay[num] * 2, 1000 / (af_delay[num] * 2));
-							else sprintf(str, "Auto fire: OFF");
-							Info(str);
-						}
-						else InfoMessage((!found) ? "\n\n          Auto fire\n             ON" :
-							"\n\n          Auto fire\n             OFF");
+						if (hasAPI1_5()) {
+              				if (!found)
+                				sprintf(str, "Autofire: %.1fhz", af_hz[af_rate[num]]);
+              				else
+                				sprintf(str, "Autofire: OFF");
+              				Info(str);
+            			} else
+              			InfoMessage((!found)
+                              ? "\n\n          Autofire\n             ON"
+                              : "\n\n          Autofire\n             OFF");
 
 						return;
 					}
-					else if (lastmask[num] & 0xF)
-					{
-						if (lastmask[num] & 9)
-						{
-							af_delay[num] += AF_STEP << ((lastmask[num] & 1) ? 1 : 0);
-							if (af_delay[num] > AF_MAX) af_delay[num] = AF_MAX;
-						}
-						else
-						{
-							af_delay[num] -= AF_STEP << ((lastmask[num] & 2) ? 1 : 0);
-							if (af_delay[num] < AF_MIN) af_delay[num] = AF_MIN;
-						}
+					else if (lastmask[num] & 0xF) {
+						if (lastmask[num] & 1)
+							af_rate[num]++;
+						if (lastmask[num] & 2)
+							af_rate[num]--;
+						if (af_rate[num] >= num_af_rates)
+							af_rate[num] = num_af_rates - 1;
+						else if (af_rate[num] < 0)
+							af_rate[num] = 0;
 
 						static char str[256];
 
 						if (hasAPI1_5())
 						{
-							sprintf(str, "Auto fire period: %dms (%uhz)", af_delay[num] * 2, 1000 / (af_delay[num] * 2));
+              				sprintf(str, "Autofire: %.1fhz", af_hz[af_rate[num]]);
 							Info(str);
 						}
 						else
 						{
-							sprintf(str, "\n\n       Auto fire period\n            %dms(%uhz)", af_delay[num] * 2, 1000 / (af_delay[num] * 2));
+              				sprintf(str, "\n\n       Autofire\n            %.1fhz", af_hz[af_rate[num]]);
 							InfoMessage(str);
 						}
 
@@ -5787,10 +5820,13 @@ int input_test(int getchar)
 int input_poll(int getchar)
 {
 	PROFILE_FUNCTION();
-
+ 	if (!autofire_cfg_parsed) parse_autofire_cfg();
 	static int af[NUMPLAYERS] = {};
-	static uint32_t time[NUMPLAYERS] = {};
+	static int af_frame_count[NUMPLAYERS] = {};
 	static uint64_t joy_prev[NUMPLAYERS] = {};
+
+	static bool new_frame = false;
+  	static uint32_t next_frame_time = GetTimer(pcurrent_video_info->vtime / 100000);
 
 	int ret = input_test(getchar);
 	if (getchar) return ret;
@@ -5826,26 +5862,25 @@ int input_poll(int getchar)
 
 	if (grabbed)
 	{
-		for (int i = 0; i < NUMPLAYERS; i++)
-		{
-			int send = 0;
-			if (af_delay[i] < AF_MIN) af_delay[i] = AF_MIN;
-
-			/* Autofire handler */
-			if (joy[i] & autofire[i])
-			{
-				if (!time[i]) time[i] = GetTimer(af_delay[i]);
-				else if ((joy[i] ^ joy_prev[i]) & autofire[i])
-				{
-					time[i] = GetTimer(af_delay[i]);
-					af[i] = 0;
-				}
-				else if (CheckTimer(time[i]))
-				{
-					time[i] = GetTimer(af_delay[i]);
-					af[i] = !af[i];
-					send = 1;
-				}
+		if (CheckTimer(next_frame_time)) {
+      		new_frame = true;
+      		next_frame_time = GetTimer(pcurrent_video_info->vtime / 100000);
+    	}
+		
+		for (int i = 0; i < NUMPLAYERS; i++) {
+      		int send = 0;
+		
+			if (new_frame) {
+				if (joy[i] & autofire[i]) {
+          		//printf("pattern: %d\n", af_pattern[af_rate[i]]);
+          		//printf("length: %d\n", af_length[af_rate[i]]);
+          		//printf("hz: %f\n", af_hz[af_rate[i]]);
+          		//printf("vidtiming: %d\n", pcurrent_video_info->vtime);
+          		af[i] = (af_pattern[af_rate[i]] >> af_frame_count[i]) & 1;
+          		send = 1;
+          		if (++(af_frame_count[i]) >= af_length[af_rate[i]]) 
+            		af_frame_count[i] = 0;
+        		}
 			}
 
 			int newdir = ((((uint32_t)(joy[i]) | (uint32_t)(joy[i] >> 32)) & 0xF) != (((uint32_t)(joy_prev[i]) | (uint32_t)(joy_prev[i] >> 32)) & 0xF));
@@ -5861,6 +5896,7 @@ int input_poll(int getchar)
 				user_io_digital_joystick(i, af[i] ? joy[i] & ~autofire[i] : joy[i], newdir);
 			}
 		}
+		new_frame = false;
 	}
 
 	if (!grabbed || user_io_osd_is_visible())
