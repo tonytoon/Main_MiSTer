@@ -28,3 +28,5 @@ host
 *.user
 .vs
 MiSTer
+setup_default_toolchain.sh
+.gitignore

@@ -101,7 +101,7 @@ typedef struct {
 	uint8_t lookahead;
 	char main[1024];
 	char vfilter_interlace_default[1023];
-	char autofire_rates[64];
+	char autofire_rates[255];
 	uint8_t autofire_rate_default;
 } cfg_t;
 
