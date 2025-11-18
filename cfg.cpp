@@ -134,7 +134,6 @@ static const ini_var_t ini_vars[] =
 	{ "MAIN", (void*)(&(cfg.main)), STRING, 0, sizeof(cfg.main) - 1 },
 	{ "VFILTER_INTERLACE_DEFAULT", (void*)(&(cfg.vfilter_interlace_default)), STRING, 0, sizeof(cfg.vfilter_interlace_default) - 1 },
 	{ "AUTOFIRE_RATES", (void *)(&(cfg.autofire_rates)), STRING, 0, sizeof(cfg.autofire_rates) - 1 },
-	{ "AUTOFIRE_RATE_DEFAULT", (void *)(&(cfg.autofire_rate_default)), UINT8, 0, 30 },
 };
 
 static const int nvars = (int)(sizeof(ini_vars) / sizeof(ini_var_t));
@@ -598,7 +597,6 @@ void cfg_parse()
 	using_video_section = false;
 	cfg_error_count = 0;
 	strcpy(cfg.autofire_rates, "7.5, 15, 20, 30");
-	cfg.autofire_rate_default = 2;
 	ini_parse(altcfg(), video_get_core_mode_name(1));
 	if (has_video_sections && !using_video_section)
 	{
