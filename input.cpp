@@ -1649,7 +1649,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 static int kbd_toggle = 0;
 static uint64_t joy[NUMPLAYERS] = {};		// 0-31 primary mappings, 32-64 alternate
-static uint64_t autofire[NUMPLAYERS] = {};	// 0-31 primary mappings, 32-64 alternate
+//static uint64_t autofire[NUMPLAYERS] = {};	// 0-31 primary mappings, 32-64 alternate
 static uint32_t autofirecodes[NUMPLAYERS][BTN_NUM] = {};
 
 static uint32_t crtgun_timeout[NUMDEV] = {};
@@ -1889,9 +1889,11 @@ static void joy_digital(int jnum, uint64_t mask, uint32_t code, char press, int 
 				{
 					if (lastcode[num] && lastmask[num]) // lastcode[num] is forced to zero for directions
 					{
+						// mask is the bit for that button
+						// btn is the integer value (for indexing)
 						uint64_t btn = __builtin_ctzll(lastmask[num]);
 						if (++btn_af_rate_idx[num][btn] >= num_af_rates) {
-							btn_af_rate_idx[num][btn] = 0;
+							btn_af_rate_idx[num][btn] = 0; // autofire rate at index 0 is used for off
 						}
 						
 						if (hasAPI1_5()) {
@@ -5830,31 +5832,41 @@ int input_poll(int getchar)
 
 	if (grabbed)
 	{
-		for (int i = 0; i < NUMPLAYERS; i++) {
-			int send = 0;
-			// only check for new frame if we're actually using autofire to reduce syscalls
-			
-			if (joy[i] && !new_frame) {
-				clock_gettime(CLOCK_MONOTONIC, &ts);
-				now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-				if (now >= next_frame_time) {
-					variance[num_variance++] = now - next_frame_time;
-					new_frame = true;
-					next_frame_time = now + pcurrent_video_info->vtime * 10ull;
-				}
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+		if (now >= next_frame_time) {
+			variance[num_variance++] = now - next_frame_time;
+			new_frame = true;
+			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
+		}
+		
+		/*
+		if (num_variance >= VARIANCE_SAMPLES) {
+				uint64_t sum = 0;
+				for (int j = 0; j < VARIANCE_SAMPLES; j++)
+					sum += variance[j];
+				printf("average variance over %d frames: %lluns", VARIANCE_SAMPLES, sum / VARIANCE_SAMPLES);
+				num_variance = 0;
 			}
-			//if (num_variance >= VARIANCE_SAMPLES) {
-			//	uint64_t sum = 0;
-			//	for (int j = 0; j < VARIANCE_SAMPLES; j++)
-			//		sum += variance[j];
-			//	printf("average variance over %d frames: %lluns", VARIANCE_SAMPLES, sum / VARIANCE_SAMPLES);
-			//	num_variance = 0;
-			//}
+		*/
 
+		for (int i = 0; i < NUMPLAYERS; i++) {
+			bool send = false;
 			if (new_frame) {
 				prev_autofire_mask[i] = autofire_mask[i];
 				autofire_mask[i] = 0xFull | 0xFull << 32; // dpad directions primary and alternate
 				
+				/* 
+				new autofire
+				when cfg is parsed we built a bitmask that turns the target rate in hz
+				into a pattern of per-frame on/off for button presses
+				every frame we shift that mask one bit to the right and take the LSB as
+				whether the button should be held or released this frame
+
+				buttons that don't have autofire enabled are assigned a mask of 1 with a period
+				of 1.
+				*/
+
 				for (int btn = 0; btn < NUMBUTTONS * 2; btn++)
 				{
 						uint8_t rate_idx  = btn_af_rate_idx[i][btn];
@@ -5866,7 +5878,7 @@ int input_poll(int getchar)
 						if (++btn_af_frame_count[i][btn] >= af_cycle_length[btn_af_rate_idx[i][btn]])
 							btn_af_frame_count[i][btn] = 0;
 				}
-				if (prev_autofire_mask[i] != autofire_mask[i]) send = 1;
+				if (prev_autofire_mask[i] != autofire_mask[i]) send = true;
 			}
 
 			int newdir = ((((uint32_t)(joy[i]) | (uint32_t)(joy[i] >> 32)) & 0xF) != (((uint32_t)(joy_prev[i]) | (uint32_t)(joy_prev[i] >> 32)) & 0xF));
@@ -5875,17 +5887,12 @@ int input_poll(int getchar)
 			if (new_joy != joy_prev[i])
 			{
 				joy_prev[i] = new_joy;
-				send = 1;
+				send = true;
 			}
 
 			if (send)
 			{
-				//printf("joy_prev[i]: %llu\n", joy_prev[i]);
-				//printf("joy[i]: %llu\n", joy[i]);
-				//printf("autofire_mask[i]: %llu\n", autofire_mask[i]);
-				//printf("new_joy: %llu\n", new_joy);
 				user_io_digital_joystick(i, new_joy, newdir);
-				//user_io_digital_joystick(i, af[i] ? joy[i] & ~autofire_mask[i] : joy[i], newdir);
 			}
 		}
 		new_frame = false;
@@ -5899,7 +5906,7 @@ int input_poll(int getchar)
 
 			joy[i] = 0;
 			//af[i] = 0;
-			autofire[i] = 0;
+			//autofire[i] = 0;
 		}
 	}
 
@@ -6062,10 +6069,10 @@ snprintf(cfg_string, sizeof(cfg_string), "%s", cfg.autofire_rates);
 
 token = strtok(cfg_string, ",");
 while (token && count < MAX_AF_RATES) {
-    // Check for binary literal prefix
+    // check for binary literal prefix
     if ((token[0] == '0') && (token[1] == 'b' || token[1] == 'B')) {
 
-        // Parse binary (skip "0b")
+        // parse binary (skip "0b")
         uint64_t mask = 0;
         const char *p = token + 2;
 
@@ -6082,8 +6089,8 @@ while (token && count < MAX_AF_RATES) {
         }
 
         if (valid) {
-            // Special handling: use binary literal directly
-            af_rate_hz[count]      = 99.9f;     // marker: literal mode
+            // special handling: use binary literal directly
+            af_rate_hz[count]      = 99.9f;     // custom rate
             af_cycle_mask[count]   = mask;
             af_cycle_length[count] = p - (token + 2);
             count++;
@@ -6107,8 +6114,8 @@ while (token && count < MAX_AF_RATES) {
 num_af_rates = count;
 
 printf("Number of autofire rates: %d\n", num_af_rates);
-  /*
-  // bubble sort? in my hps? in this economy?
+
+// bubble sort? in my hps? in this economy?
   for (int i = 0; i < num_af_rates - 1; i++) {
     for (int j = 0; j < num_af_rates - 1 - i; j++) {
         if (af_rate_hz[j] > af_rate_hz[j + 1]) {
@@ -6118,7 +6125,6 @@ printf("Number of autofire rates: %d\n", num_af_rates);
 		}
     }
   }
-  */
 
   // take the requested rate in hz and generate a bitmask representing the pattern of button
   // press/release for each frame and the length of the cycle in frames
