@@ -1891,32 +1891,42 @@ static void joy_digital(int jnum, uint64_t mask, uint32_t code, char press, int 
 					{
 						// mask is the bit for that button
 						// btn is the integer value (for indexing)
-						uint64_t btn = __builtin_ctzll(lastmask[num]);
-						if (++btn_af_rate_idx[num][btn] >= num_af_rates) {
-							btn_af_rate_idx[num][btn] = 0; // autofire rate at index 0 is used for off
-						}
+						uint64_t mask = lastmask[num];
+						// current codepath wouldn't let more than one button come in via the mask
+						// but futureproofing just in case it happens
+						while (mask) {
+    						uint64_t btn = __builtin_ctzll(mask);   // index of lowest 1-bit
+    						mask &= mask - 1;                    
 						
-						if (hasAPI1_5()) {
-							char *strat = str;
-							float rate = af_rate_hz[btn_af_rate_idx[num][btn]];
-							if (btn < 32)
-								strat += sprintf(strat, "%s", joy_bnames[btn-4]);
-							else
-								strat += sprintf(strat, "%s (alt)", joy_bnames[btn-36]);
-
-							if (rate == 0.0f) {
-									strat += sprintf(strat, " autofire: Off");
-							} else if (rate == 99.9f) {
-									strat += sprintf(strat, " autofire: custom");
-							} else {
-									strat += sprintf(strat, " autofire: %.1fhz", rate);
+							//uint64_t btn = __builtin_ctzll(lastmask[num]);
+							if (++btn_af_rate_idx[num][btn] >= num_af_rates) {
+								btn_af_rate_idx[num][btn] = 0; // autofire rate at index 0 is used for off
 							}
-							Info(str);
-            			} else
-              			InfoMessage((!autofire_mask[num])
-                              ? "\n\n          Autofire\n             ON"
-                              : "\n\n          Autofire\n             OFF");
+							
+							// TODO clean up a bit for multiple passes
+							if (hasAPI1_5()) {
+								char *strat = str;
+								float rate = af_rate_hz[btn_af_rate_idx[num][btn]];
+								if (btn < 32)
+									strat += sprintf(strat, "%s", joy_bnames[btn-4]);
+								else
+									strat += sprintf(strat, "%s (alt)", joy_bnames[btn-36]);
 
+								if (rate == 0.0f) {
+										strat += sprintf(strat, " autofire: Off");
+								} else if (rate == 99.9f) {
+										strat += sprintf(strat, " autofire: custom");
+								} else {
+										strat += sprintf(strat, " autofire: %.1fhz", rate);
+								}
+								Info(str);
+							} else
+							InfoMessage((!autofire_mask[num])
+								? "\n\n          Autofire\n             ON"
+								: "\n\n          Autofire\n             OFF");
+
+							//return;
+						}
 						return;
 					}
 				}
