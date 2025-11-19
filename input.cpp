@@ -5816,6 +5816,8 @@ double compute_stddev(const uint64_t *arr, int N)
 // don't run at exactly 60hz but we're still at the mercy of
 // cpu timers so don't expect magic
 
+#define SIXTYHERTZ 1666667 // fallback if vtime doesn't work
+
 static bool timer_started = false;
 static uint64_t new_frame;
 static int timerfd = -1;
@@ -5831,7 +5833,7 @@ static uint64_t prev_vtime = pcurrent_video_info->vtime;
 
 inline bool vrefresh_changed()
 {
-	if (prev_vtime != pcurrent_video_info->vtime) {
+	if (prev_vtime != ((bool)pcurrent_video_info->vtime ? pcurrent_video_info->vtime : SIXTYHERTZ)) {
 		if (timerfd >= 0) {
 			close(timerfd);	// recycle timerfd
 			timerfd = -1;
@@ -5893,12 +5895,13 @@ int start_vtimer(uint64_t interval_ns, uint64_t &vtimer_start_ns) {
 // returns false if both fail or if vrefresh appears to be 0
 bool init_timer()
 {
-	if (pcurrent_video_info->vtime) {
-		if (!timer_started && start_vtimer(pcurrent_video_info->vtime * 10ull, vtimer_start_ns)) {
+	uint64_t interval_ns = (bool)pcurrent_video_info->vtime ? pcurrent_video_info->vtime : SIXTYHERTZ;
+	if (interval_ns) {
+		if (!timer_started && start_vtimer(interval_ns * 10ull, vtimer_start_ns)) {
 			struct timespec ts;
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
+			next_frame_time = now + interval_ns * 10ull;
 			printf("timerfd failed, reverting to polling behavior");
 			return true;
 		} else return true;
@@ -5996,8 +5999,7 @@ int input_poll(int getchar)
 		if (timer_started)
 			new_frame = check_vtimer(pcurrent_video_info->vtime * 10ull);
 		
-		/* uncomment to benchmark autofire jitter */
-		/*
+#ifdef BENCHMARKAF
 		static uint64_t late_times[1024];
 		static int num_times = 0;
 
@@ -6021,7 +6023,7 @@ int input_poll(int getchar)
        			num_times, sd_ns, sd_us, sd_ms, pct, hz);
 			num_times = 0;
 		}
-		*/
+#endif // BENCHMARKAF
 
 		for (int i = 0; i < NUMPLAYERS; i++) {
 			bool send = false;
@@ -6051,6 +6053,7 @@ int input_poll(int getchar)
 							btn_af_frame_count[i][btn] = 0;
 				}
 				if (prev_autofire_mask[i] != autofire_mask[i]) send = true;
+				/* end autofire */
 			}
 
 			int newdir = ((((uint32_t)(joy[i]) | (uint32_t)(joy[i] >> 32)) & 0xF) != (((uint32_t)(joy_prev[i]) | (uint32_t)(joy_prev[i] >> 32)) & 0xF));
