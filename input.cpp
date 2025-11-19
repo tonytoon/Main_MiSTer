@@ -15,6 +15,7 @@
 #include <linux/uinput.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/timerfd.h>
 #include <stdarg.h>
 #include <math.h>
 #include <time.h>
@@ -1225,6 +1226,8 @@ static devInput player_pdsp[NUMPLAYERS] = {};
 int mfd = -1;
 int mwd = -1;
 
+//int start_vtimer(int* timerfd, uint64_t interval_ns);
+
 static int set_watch()
 {
 	mwd = -1;
@@ -1650,7 +1653,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 static int kbd_toggle = 0;
 static uint64_t joy[NUMPLAYERS] = {};		// 0-31 primary mappings, 32-64 alternate
 //static uint64_t autofire[NUMPLAYERS] = {};	// 0-31 primary mappings, 32-64 alternate
-static uint32_t autofirecodes[NUMPLAYERS][BTN_NUM] = {};
+//static uint32_t autofirecodes[NUMPLAYERS][BTN_NUM] = {};
 
 static uint32_t crtgun_timeout[NUMDEV] = {};
 
@@ -1847,7 +1850,7 @@ static uint32_t osdbtn = 0;
 static bool autofire_cfg_parsed = false;
 static int btn_af_rate_idx[NUMPLAYERS][NUMBUTTONS * 2] = {};
 static int btn_af_frame_count[NUMPLAYERS][NUMBUTTONS * 2] = {};
-static int btn_af_num_active[NUMPLAYERS] = {}; 	// how many buttons have autofire toggled.
+//static int btn_af_num_active[NUMPLAYERS] = {}; 	// how many buttons have autofire toggled.
 static int num_af_rates = 0;
 static int af_cycle_mask[MAX_AF_RATES]; 		// bitmask indicating button press/release per frame
 static int af_cycle_length[MAX_AF_RATES];  		// number of frames before pattern repeats
@@ -5783,27 +5786,178 @@ int input_test(int getchar)
 	return 0;
 }
 
-static struct timespec ts;
+double compute_stddev(const uint64_t *arr, int N)
+{
+    if (N <= 1) return 0.0;
+
+	// mean
+	double sum = 0.0;
+    for (int i = 0; i < N; i++)
+        sum += (double)arr[i];
+
+    double mean = sum / N;
+
+	// variance
+	double var = 0.0;
+    for (int i = 0; i < N; i++) {
+        double diff = (double)arr[i] - mean;
+        var += diff * diff;
+    }
+    var /= N;
+
+	// standard deviation
+	return sqrt(var);
+}
+
+/************* AUTOFIRE TIMER STUFF ********************/
+// autofire timing
+// use vtime rather than assuming 16.67ms per frame
+// in theory this will reduce drift over time since most games
+// don't run at exactly 60hz but we're still at the mercy of
+// cpu timers so don't expect magic
+
+static bool timer_started = false;
+static uint64_t new_frame;
+static int timerfd = -1;
+static uint64_t vtimer_start_ns;
+//static struct timespec ts; 			// only used if polling instead of timerfd
+static uint64_t now;				// ...
+static uint64_t next_frame_time;	// ...
+static uint64_t prev_vtime = pcurrent_video_info->vtime;
+
+// return true if a core's vrefresh has changed
+// this might happen if resolution changes or some cores
+// allow the user to adjust vrefresh for display compatibility
+
+inline bool vrefresh_changed()
+{
+	if (prev_vtime != pcurrent_video_info->vtime) {
+		if (timerfd >= 0) {
+			close(timerfd);	// recycle timerfd
+			timerfd = -1;
+		}
+		prev_vtime = pcurrent_video_info->vtime;
+		timer_started = false;
+		return true;
+	}
+	return false;
+}
+
+// initialize timerfd based timer
+// return 1 on failure
+int start_vtimer(uint64_t interval_ns, uint64_t &vtimer_start_ns) {
+	timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (timerfd < 0) {
+        perror("timerfd_create");
+        return 1;
+    };
+
+    // get current time to start absolute time
+	// not to be confused with absolute batman
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+	
+	uint64_t now_ns = (uint64_t)now_ts.tv_sec * 1000000000ULL + now_ts.tv_nsec;
+	uint64_t first_expiration_ns = now_ns + interval_ns;
+
+	struct itimerspec its = {
+		.it_interval = { .tv_sec = 0, .tv_nsec = 0 },
+		.it_value    = { .tv_sec = 0, .tv_nsec = 0 }
+	};
+
+    // first expiration = now + interval
+    its.it_value = now_ts;
+    its.it_value.tv_nsec += interval_ns;
+    if (its.it_value.tv_nsec >= 1000000000L) {
+        its.it_value.tv_nsec -= 1000000000L;
+        its.it_value.tv_sec++;
+    }
+
+    // future expirations
+    its.it_interval.tv_sec  = 0;
+    its.it_interval.tv_nsec = interval_ns;
+
+    // absolute time
+    if (timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &its, NULL) < 0) {
+        perror("timerfd_settime");
+        return 1;
+    }
+	vtimer_start_ns = first_expiration_ns;
+	float hz = 1e9f / interval_ns;
+    printf("%.2fhz timer started.\n", hz);
+	return 0;
+}
+
+// attempt to start timerfd based timer
+// if that fails, fall back to polling a clock
+// returns false if both fail or if vrefresh appears to be 0
+bool init_timer()
+{
+	if (pcurrent_video_info->vtime) {
+		if (!timer_started && start_vtimer(pcurrent_video_info->vtime * 10ull, vtimer_start_ns)) {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
+			printf("timerfd failed, reverting to polling behavior");
+			return true;
+		} else return true;
+	}
+	return false;
+}
+
+// check if timer has fired yet or not.
+// return nanoseconds since timer expired
+// return zero otherwise
+uint64_t check_vtimer(uint64_t interval_ns) {
+	uint64_t late = 0;
+	if (timerfd == -1) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+		if (now >= next_frame_time) {
+			late = now - next_frame_time;
+			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
+		}
+	}
+	else {
+		uint64_t expirations;
+		ssize_t n = read(timerfd, &expirations, sizeof(expirations));
+		struct timespec now;
+
+		if (n != sizeof(expirations))
+			return 0;   // timer did not fire
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+
+		// Track expected timing
+		static uint64_t tick_count = 0;
+		static uint64_t start_ns = 0;
+
+		if (tick_count == 0) {
+			// First activation establishes start time
+    		start_ns = vtimer_start_ns;
+		}
+		
+		uint64_t expected_ns = start_ns + tick_count * interval_ns;
+		tick_count += expirations;
+
+		late = now_ns - expected_ns;
+	}
+	return late;
+}
+
+/************* END AUTOFIRE TIMER STUFF ****************/
 
 int input_poll(int getchar)
 {
 	PROFILE_FUNCTION();
  	if (!autofire_cfg_parsed) parse_autofire_cfg();
-	//static int af[NUMPLAYERS] = {};
-	//static int af_frame_count[NUMPLAYERS] = {};
 	static uint64_t joy_prev[NUMPLAYERS] = {};
 
-	static bool new_frame = false;
-  	
-	// autofire timing
-	// use vtime rather than assuming 16.67ms per frame
-	// in theory this will reduce drift over time since most games
-	// don't run at exactly 60hz but we're still at the mercy of
-	// jittery timers so don't expect magic
-	
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	static uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-    static uint64_t next_frame_time = now + pcurrent_video_info->vtime * 10ull;
+	vrefresh_changed(); // restart timers if vrefresh has changed;
+	if (!timer_started) timer_started = init_timer();
 
 	int ret = input_test(getchar);
 	if (getchar) return ret;
@@ -5836,36 +5990,42 @@ int input_poll(int getchar)
 	}
 
 	if (!mouse_emu_x && !mouse_emu_y) mouse_timer = 0;
-	#define VARIANCE_SAMPLES 4096
-	static uint64_t variance[VARIANCE_SAMPLES] = {};
-	static int num_variance = 0;
 
 	if (grabbed)
 	{
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-		if (now >= next_frame_time) {
-			variance[num_variance++] = now - next_frame_time;
-			new_frame = true;
-			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
-		}
+		if (timer_started)
+			new_frame = check_vtimer(pcurrent_video_info->vtime * 10ull);
 		
+		/* uncomment to benchmark autofire jitter */
 		/*
-		if (num_variance >= VARIANCE_SAMPLES) {
-				uint64_t sum = 0;
-				for (int j = 0; j < VARIANCE_SAMPLES; j++)
-					sum += variance[j];
-				printf("average variance over %d frames: %lluns", VARIANCE_SAMPLES, sum / VARIANCE_SAMPLES);
-				num_variance = 0;
-			}
+		static uint64_t late_times[1024];
+		static int num_times = 0;
+
+		if (new_frame)
+			late_times[num_times++] = new_frame;
+
+		if (num_times >= 1024) {
+			uint64_t sum = 0;
+			for (int i = 0; i < 1024; i++)
+				sum += late_times[i];
+			double average = sum / num_times;
+			uint64_t interval_ns = pcurrent_video_info->vtime * 10ull;
+			float hz = 1e9f / interval_ns;
+			double sd_ns = compute_stddev(late_times, num_times);
+			double sd_us = sd_ns / 1000.0;
+			double sd_ms = sd_ns / 1e6;
+			double frame_ns = 1e9f / hz;
+			double pct = (sd_ns / frame_ns) * 100.0;
+
+			printf("jitter stddev over %d frames: %.0f ns (%.2f us, %.4f ms, %.3f%% of %.2fhz frame)\n",
+       			num_times, sd_ns, sd_us, sd_ms, pct, hz);
+			num_times = 0;
+		}
 		*/
 
 		for (int i = 0; i < NUMPLAYERS; i++) {
 			bool send = false;
 			if (new_frame) {
-				prev_autofire_mask[i] = autofire_mask[i];
-				autofire_mask[i] = 0xFull | 0xFull << 32; // dpad directions primary and alternate
-				
 				/* 
 				new autofire
 				when cfg is parsed we built a bitmask that turns the target rate in hz
@@ -5876,7 +6036,9 @@ int input_poll(int getchar)
 				buttons that don't have autofire enabled are assigned a mask of 1 with a period
 				of 1.
 				*/
-
+				prev_autofire_mask[i] = autofire_mask[i];
+				autofire_mask[i] = 0xFull | 0xFull << 32; // dpad directions primary and alternate
+				
 				for (int btn = 0; btn < NUMBUTTONS * 2; btn++)
 				{
 						uint8_t rate_idx  = btn_af_rate_idx[i][btn];
@@ -5915,8 +6077,7 @@ int input_poll(int getchar)
 			if(joy[i]) user_io_digital_joystick(i, 0, 1);
 
 			joy[i] = 0;
-			//af[i] = 0;
-			//autofire[i] = 0;
+			autofire_mask[i] = 0xFull | 0xFull << 32;
 		}
 	}
 
@@ -6091,7 +6252,8 @@ while (token && count < MAX_AF_RATES) {
         while (*p) {
             if (*p == '0' || *p == '1') {
                 mask = (mask << 1) | (*p - '0');
-            } else {
+            }
+			else {
                 valid = 0;  // invalid binary char
                 break;
             }
@@ -6099,7 +6261,7 @@ while (token && count < MAX_AF_RATES) {
         }
 
         if (valid) {
-            // special handling: use binary literal directly
+            // use binary literal directly
             af_rate_hz[count]      = 99.9f;     // custom rate
             af_cycle_mask[count]   = mask;
             af_cycle_length[count] = p - (token + 2);
@@ -6126,18 +6288,21 @@ num_af_rates = count;
 printf("Number of autofire rates: %d\n", num_af_rates);
 
 // bubble sort? in my hps? in this economy?
-  for (int i = 0; i < num_af_rates - 1; i++) {
-    for (int j = 0; j < num_af_rates - 1 - i; j++) {
-        if (af_rate_hz[j] > af_rate_hz[j + 1]) {
+// if the user made custom rates in a weird order sort them
+// smallest to largest
+for (int i = 0; i < num_af_rates - 1; i++) {
+	for (int j = 0; j < num_af_rates - 1 - i; j++) {
+		if (af_rate_hz[j] > af_rate_hz[j + 1]) {
 			float tmp = af_rate_hz[j];
 			af_rate_hz[j] = af_rate_hz[j + 1];
 			af_rate_hz[j + 1] = tmp;
 		}
-    }
-  }
+	}
+}
 
   // take the requested rate in hz and generate a bitmask representing the pattern of button
   // press/release for each frame and the length of the cycle in frames
+  // will choose the rate closest to requested that evenly divides into 60
   // e.g. 15hz has a bitmask of 0011 and cycle length of 4 frames (hold button for two frames,
   // release button for two frames)
 

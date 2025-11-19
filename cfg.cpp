@@ -596,7 +596,7 @@ void cfg_parse()
 	has_video_sections = false;
 	using_video_section = false;
 	cfg_error_count = 0;
-	strcpy(cfg.autofire_rates, "10, 20, 30"); // we will parse this string ourselves in input.cpp
+	strcpy(cfg.autofire_rates, "10.0, 20.0, 30.0"); // we will parse this string ourselves in input.cpp
 	ini_parse(altcfg(), video_get_core_mode_name(1));
 	if (has_video_sections && !using_video_section)
 	{
