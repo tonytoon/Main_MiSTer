@@ -5968,11 +5968,12 @@ bool init_timer()
 {
 	uint64_t interval_ns = pcurrent_video_info->vtime * 10ull;
 		if (usetimerfd && interval_ns) {
-			if (!timer_started)
+			if (!timer_started) {
 				if (start_vtimer(interval_ns, vtimer_start_ns) == 0)
 					return true;
 				else
 					return false;
+			}
 		}
 		
 		else if (usepolling && interval_ns) {
