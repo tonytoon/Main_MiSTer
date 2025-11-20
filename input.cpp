@@ -1844,6 +1844,63 @@ static void joy_apply_deadzone(int* x, int* y, const devInput* dev, const int st
 
 static uint32_t osdbtn = 0;
 
+static int num_af_rates = 0;
+
+// structures and functions to track autofire by code
+#define MAX_AF_CODES 512
+
+struct AutofireEntry {
+	uint32_t code;
+	int index;
+};
+
+struct AutofireTable {
+	int count;
+	struct AutofireEntry autofirecodes[MAX_AF_CODES];
+};
+
+static struct AutofireTable autofiretable[NUMPLAYERS];
+
+// returns 0 if the code does not have autofire
+// returns >0 if the code does
+int get_autofire_code(int player, uint32_t code) {
+	for (int i = 0; i != autofiretable[player].count; i++) {
+		if (autofiretable[player].autofirecodes[i].code == code)
+			return autofiretable[player].autofirecodes[i].index;
+	}
+	return 0;
+}
+
+// set to non-zero value to enable autofire
+// currently we store the index to the rate in af_rate_idx, but *do not* use it
+// from this struct. if we figured out a way to more easily correlate code -> button
+void set_autofire_code(int player, uint32_t code, int index)
+{
+	for (int i = 0; i != autofiretable[player].count; i++) {
+		if (autofiretable[player].autofirecodes[i].code == code) {
+			autofiretable[player].autofirecodes[i].index = index;
+			return;
+		}
+	}
+	// code wasn't found, we need to set it.
+	if (autofiretable[player].count < MAX_AF_CODES) {
+		autofiretable[player].autofirecodes[autofiretable[player].count].code = code;
+		autofiretable[player].autofirecodes[autofiretable[player].count].index = index;
+		autofiretable[player].count++;
+	}
+	else {
+		printf("how did you define %d different buttons to have autofire?\n", MAX_AF_CODES);
+	}
+}
+
+void inc_autofire_code(int player, uint32_t code)
+{
+	int index = get_autofire_code(player, code) + 1;
+	if (index >= num_af_rates) index = 0;
+	set_autofire_code(player, code, index);
+}
+
+
 // autofire related variables
 #define MAX_AF_RATES 6
 
@@ -1851,7 +1908,7 @@ static bool autofire_cfg_parsed = false;
 static int btn_af_rate_idx[NUMPLAYERS][NUMBUTTONS * 2] = {};
 static int btn_af_frame_count[NUMPLAYERS][NUMBUTTONS * 2] = {};
 //static int btn_af_num_active[NUMPLAYERS] = {}; 	// how many buttons have autofire toggled.
-static int num_af_rates = 0;
+//static int num_af_rates = 0;					// defined earlier
 static int af_cycle_mask[MAX_AF_RATES]; 		// bitmask indicating button press/release per frame
 static int af_cycle_length[MAX_AF_RATES];  		// number of frames before pattern repeats
 static float af_rate_hz[MAX_AF_RATES];	  		// target autofire rate in hz
@@ -1900,7 +1957,17 @@ static void joy_digital(int jnum, uint64_t mask, uint32_t code, char press, int 
 						while (mask) {
     						uint64_t btn = __builtin_ctzll(mask);   // index of lowest 1-bit
     						mask &= mask - 1;                    
-						
+							
+							/* TODO */
+							/* 
+							   currently we track the code of each physical (or virtual chorded) 
+							   button that has autofire enabled. but we actually apply any autofire
+							   masks to joy[i] later based on the value we're also setting in btn_af_rate_idx[][]
+							   this works fine if we have just our primary and alternate button mappings
+							   but if more advanced/chorded inputs get added, it'll need some reconsideration.
+							*/
+
+							inc_autofire_code(num, lastcode[num]);
 							//uint64_t btn = __builtin_ctzll(lastmask[num]);
 							if (++btn_af_rate_idx[num][btn] >= num_af_rates) {
 								btn_af_rate_idx[num][btn] = 0; // autofire rate at index 0 is used for off
@@ -5816,16 +5883,18 @@ double compute_stddev(const uint64_t *arr, int N)
 // don't run at exactly 60hz but we're still at the mercy of
 // cpu timers so don't expect magic
 
+static int usetimerfd = 1;
+static int usepolling = 1;
+
 #define SIXTYHERTZ 1666667 // fallback if vtime doesn't work
 
 static bool timer_started = false;
 static uint64_t new_frame;
 static int timerfd = -1;
 static uint64_t vtimer_start_ns;
-//static struct timespec ts; 			// only used if polling instead of timerfd
 static uint64_t now;				// ...
 static uint64_t next_frame_time;	// ...
-static uint64_t prev_vtime = pcurrent_video_info->vtime;
+static uint32_t prev_vtime = pcurrent_video_info->vtime;
 
 // return true if a core's vrefresh has changed
 // this might happen if resolution changes or some cores
@@ -5833,7 +5902,8 @@ static uint64_t prev_vtime = pcurrent_video_info->vtime;
 
 inline bool vrefresh_changed()
 {
-	if (prev_vtime != ((bool)pcurrent_video_info->vtime ? pcurrent_video_info->vtime : SIXTYHERTZ)) {
+	if (prev_vtime != pcurrent_video_info->vtime) {
+		printf("prev_vtime: %u vtime: %u\n", prev_vtime, pcurrent_video_info->vtime);
 		if (timerfd >= 0) {
 			close(timerfd);	// recycle timerfd
 			timerfd = -1;
@@ -5848,7 +5918,7 @@ inline bool vrefresh_changed()
 // initialize timerfd based timer
 // return 1 on failure
 int start_vtimer(uint64_t interval_ns, uint64_t &vtimer_start_ns) {
-	timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+	timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (timerfd < 0) {
         perror("timerfd_create");
         return 1;
@@ -5882,6 +5952,7 @@ int start_vtimer(uint64_t interval_ns, uint64_t &vtimer_start_ns) {
     // absolute time
     if (timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &its, NULL) < 0) {
         perror("timerfd_settime");
+		printf("interval_ns: %llu\n", interval_ns);
         return 1;
     }
 	vtimer_start_ns = first_expiration_ns;
@@ -5895,9 +5966,33 @@ int start_vtimer(uint64_t interval_ns, uint64_t &vtimer_start_ns) {
 // returns false if both fail or if vrefresh appears to be 0
 bool init_timer()
 {
-	uint64_t interval_ns = (bool)pcurrent_video_info->vtime ? pcurrent_video_info->vtime : SIXTYHERTZ;
+	uint64_t interval_ns = pcurrent_video_info->vtime * 10ull;
+		if (usetimerfd && interval_ns) {
+			if (!timer_started)
+				if (start_vtimer(interval_ns, vtimer_start_ns) == 0)
+					return true;
+				else
+					return false;
+		}
+		
+		else if (usepolling && interval_ns) {
+			if (!timer_started) {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+			next_frame_time = now + interval_ns * 10ull;
+			float hz = 1e9f / interval_ns;
+			printf("starting %.2fhz polling timer\n", hz);
+			return true;
+			}
+		}
+
+	return false;
+
+	/*
+	//	uint64_t interval_ns = (bool)pcurrent_video_info->vtime ? pcurrent_video_info->vtime : SIXTYHERTZ;
 	if (interval_ns) {
-		if (!timer_started && start_vtimer(interval_ns * 10ull, vtimer_start_ns)) {
+		if (!timer_started && start_vtimer(interval_ns, vtimer_start_ns)) {
 			struct timespec ts;
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
@@ -5906,7 +6001,7 @@ bool init_timer()
 			return true;
 		} else return true;
 	}
-	return false;
+	return false; */
 }
 
 // check if timer has fired yet or not.
@@ -5914,7 +6009,42 @@ bool init_timer()
 // return zero otherwise
 uint64_t check_vtimer(uint64_t interval_ns) {
 	uint64_t late = 0;
-	if (timerfd == -1) {
+	if (usetimerfd) {
+		uint64_t expirations;
+		struct timespec now;
+
+		struct pollfd pfd = { timerfd, POLLIN, 0 };
+
+		if (poll(&pfd, 1, 0) <= 0)
+    		return 0; // timer not ready
+
+		read(timerfd, &expirations, sizeof(expirations));
+		/*
+		ssize_t n = read(timerfd, &expirations, sizeof(expirations));
+		
+		if (n != sizeof(expirations))
+			return 0;   // timer did not fire
+		*/
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+
+		// Track expected timing
+		static uint64_t tick_count = 0;
+		static uint64_t start_ns = 0;
+
+		if (tick_count == 0) {
+			// First activation establishes start time
+    		start_ns = vtimer_start_ns;
+		}
+		
+		uint64_t expected_ns = start_ns + tick_count * interval_ns;
+		tick_count += expirations;
+
+		late = now_ns - expected_ns;
+	}
+
+	else if (usepolling) {
 		struct timespec ts;
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
@@ -5923,6 +6053,8 @@ uint64_t check_vtimer(uint64_t interval_ns) {
 			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
 		}
 	}
+	
+	/*
 	else {
 		uint64_t expirations;
 		ssize_t n = read(timerfd, &expirations, sizeof(expirations));
@@ -5947,19 +6079,20 @@ uint64_t check_vtimer(uint64_t interval_ns) {
 		tick_count += expirations;
 
 		late = now_ns - expected_ns;
-	}
+	}*/
 	return late;
 }
 
 /************* END AUTOFIRE TIMER STUFF ****************/
+
 
 int input_poll(int getchar)
 {
 	PROFILE_FUNCTION();
  	if (!autofire_cfg_parsed) parse_autofire_cfg();
 	static uint64_t joy_prev[NUMPLAYERS] = {};
-
-	vrefresh_changed(); // restart timers if vrefresh has changed;
+	
+	if (timer_started) vrefresh_changed(); // restart timers if vrefresh has changed;
 	if (!timer_started) timer_started = init_timer();
 
 	int ret = input_test(getchar);
@@ -5999,6 +6132,7 @@ int input_poll(int getchar)
 		if (timer_started)
 			new_frame = check_vtimer(pcurrent_video_info->vtime * 10ull);
 		
+#define BENCHMARKAF
 #ifdef BENCHMARKAF
 		static uint64_t late_times[1024];
 		static int num_times = 0;
@@ -6010,7 +6144,7 @@ int input_poll(int getchar)
 			uint64_t sum = 0;
 			for (int i = 0; i < 1024; i++)
 				sum += late_times[i];
-			double average = sum / num_times;
+			//double average = sum / num_times;
 			uint64_t interval_ns = pcurrent_video_info->vtime * 10ull;
 			float hz = 1e9f / interval_ns;
 			double sd_ns = compute_stddev(late_times, num_times);
