@@ -13,12 +13,9 @@
 #include <sys/stat.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
-#include <sys/time.h>
 #include <sys/types.h>
-#include <sys/timerfd.h>
 #include <stdarg.h>
 #include <math.h>
-#include <time.h>
 
 #include "input.h"
 #include "user_io.h"
@@ -34,6 +31,7 @@
 #include "profiling.h"
 #include "gamecontroller_db.h"
 #include "str_util.h"
+#include "autofire_timer.h"
 
 #define NUMDEV 30
 #define NUMPLAYERS 6
@@ -43,7 +41,7 @@ char joy_bnames[NUMBUTTONS][32] = {};
 int  joy_bcount = 0;
 static struct pollfd pool[NUMDEV + 3];
 
-extern VideoInfo *pcurrent_video_info;
+// extern VideoInfo *pcurrent_video_info;
 
 static int ev2amiga[] =
 {
@@ -1977,18 +1975,23 @@ static void joy_digital(int jnum, uint64_t mask, uint32_t code, char press, int 
 							if (hasAPI1_5()) {
 								char *strat = str;
 								float rate = af_rate_hz[btn_af_rate_idx[num][btn]];
+								
+								// PSX buttons have very long names
+								// display this on two lines so nothing gets cropped
+								
 								if (btn < 32)
 									strat += sprintf(strat, "%s", joy_bnames[btn-4]);
 								else
 									strat += sprintf(strat, "%s (alt)", joy_bnames[btn-36]);
-
+								
 								if (rate == 0.0f) {
-										strat += sprintf(strat, " autofire: Off");
+										strat += sprintf(strat, "\nAutofire disabled");
 								} else if (rate == 99.9f) {
-										strat += sprintf(strat, " autofire: custom");
+										strat += sprintf(strat, "\nAutofire: custom");
 								} else {
-										strat += sprintf(strat, " autofire: %.1fhz", rate);
+										strat += sprintf(strat, "\nAutofire: %.1fhz", rate);
 								}
+
 								Info(str);
 							} else
 							InfoMessage((!autofire_mask[num])
@@ -5853,239 +5856,17 @@ int input_test(int getchar)
 	return 0;
 }
 
-double compute_stddev(const uint64_t *arr, int N)
-{
-    if (N <= 1) return 0.0;
-
-	// mean
-	double sum = 0.0;
-    for (int i = 0; i < N; i++)
-        sum += (double)arr[i];
-
-    double mean = sum / N;
-
-	// variance
-	double var = 0.0;
-    for (int i = 0; i < N; i++) {
-        double diff = (double)arr[i] - mean;
-        var += diff * diff;
-    }
-    var /= N;
-
-	// standard deviation
-	return sqrt(var);
-}
-
-/************* AUTOFIRE TIMER STUFF ********************/
-// autofire timing
-// use vtime rather than assuming 16.67ms per frame
-// in theory this will reduce drift over time since most games
-// don't run at exactly 60hz but we're still at the mercy of
-// cpu timers so don't expect magic
-
-static int usetimerfd = 1;
-static int usepolling = 1;
-
-#define SIXTYHERTZ 1666667 // fallback if vtime doesn't work
-
-static bool timer_started = false;
-static uint64_t new_frame;
-static int timerfd = -1;
-static uint64_t vtimer_start_ns;
-static uint64_t now;				// ...
-static uint64_t next_frame_time;	// ...
-static uint32_t prev_vtime = pcurrent_video_info->vtime;
-
-// return true if a core's vrefresh has changed
-// this might happen if resolution changes or some cores
-// allow the user to adjust vrefresh for display compatibility
-
-inline bool vrefresh_changed()
-{
-	if (prev_vtime != pcurrent_video_info->vtime) {
-		printf("prev_vtime: %u vtime: %u\n", prev_vtime, pcurrent_video_info->vtime);
-		if (timerfd >= 0) {
-			close(timerfd);	// recycle timerfd
-			timerfd = -1;
+inline void force_init_autofire_mask() {
+	// if for some reason out autofire timer breaks, that'll mess up regular inputs as well (I think)
+	// so we force our autofire mask to all 1's for each player so at least regular buttons will work
+	static bool autofire_initialized = false;
+	if (!autofire_initialized) {
+		for (int i = 0; i != NUMPLAYERS; i++) {
+			autofire_mask[i] = UINT64_MAX;
 		}
-		prev_vtime = pcurrent_video_info->vtime;
-		timer_started = false;
-		return true;
+		autofire_initialized = true;
 	}
-	return false;
 }
-
-// initialize timerfd based timer
-// return 1 on failure
-int start_vtimer(uint64_t interval_ns, uint64_t &vtimer_start_ns) {
-	timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    if (timerfd < 0) {
-        perror("timerfd_create");
-        return 1;
-    };
-
-    // get current time to start absolute time
-	// not to be confused with absolute batman
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
-	
-	uint64_t now_ns = (uint64_t)now_ts.tv_sec * 1000000000ULL + now_ts.tv_nsec;
-	uint64_t first_expiration_ns = now_ns + interval_ns;
-
-	struct itimerspec its = {
-		.it_interval = { .tv_sec = 0, .tv_nsec = 0 },
-		.it_value    = { .tv_sec = 0, .tv_nsec = 0 }
-	};
-
-    // first expiration = now + interval
-    its.it_value = now_ts;
-    its.it_value.tv_nsec += interval_ns;
-    if (its.it_value.tv_nsec >= 1000000000L) {
-        its.it_value.tv_nsec -= 1000000000L;
-        its.it_value.tv_sec++;
-    }
-
-    // future expirations
-    its.it_interval.tv_sec  = 0;
-    its.it_interval.tv_nsec = interval_ns;
-
-    // absolute time
-    if (timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &its, NULL) < 0) {
-        perror("timerfd_settime");
-		printf("interval_ns: %llu\n", interval_ns);
-        return 1;
-    }
-	vtimer_start_ns = first_expiration_ns;
-	float hz = 1e9f / interval_ns;
-    printf("%.2fhz timer started.\n", hz);
-	return 0;
-}
-
-// attempt to start timerfd based timer
-// if that fails, fall back to polling a clock
-// returns false if both fail or if vrefresh appears to be 0
-bool init_timer()
-{
-	uint64_t interval_ns = pcurrent_video_info->vtime * 10ull;
-		if (usetimerfd && interval_ns) {
-			if (!timer_started) {
-				if (start_vtimer(interval_ns, vtimer_start_ns) == 0)
-					return true;
-				else
-					return false;
-			}
-		}
-		
-		else if (usepolling && interval_ns) {
-			if (!timer_started) {
-			struct timespec ts;
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-			next_frame_time = now + interval_ns * 10ull;
-			float hz = 1e9f / interval_ns;
-			printf("starting %.2fhz polling timer\n", hz);
-			return true;
-			}
-		}
-
-	return false;
-
-	/*
-	//	uint64_t interval_ns = (bool)pcurrent_video_info->vtime ? pcurrent_video_info->vtime : SIXTYHERTZ;
-	if (interval_ns) {
-		if (!timer_started && start_vtimer(interval_ns, vtimer_start_ns)) {
-			struct timespec ts;
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-			next_frame_time = now + interval_ns * 10ull;
-			printf("timerfd failed, reverting to polling behavior");
-			return true;
-		} else return true;
-	}
-	return false; */
-}
-
-// check if timer has fired yet or not.
-// return nanoseconds since timer expired
-// return zero otherwise
-uint64_t check_vtimer(uint64_t interval_ns) {
-	uint64_t late = 0;
-	if (usetimerfd) {
-		uint64_t expirations;
-		struct timespec now;
-
-		struct pollfd pfd = { timerfd, POLLIN, 0 };
-
-		if (poll(&pfd, 1, 0) <= 0)
-    		return 0; // timer not ready
-
-		read(timerfd, &expirations, sizeof(expirations));
-		/*
-		ssize_t n = read(timerfd, &expirations, sizeof(expirations));
-		
-		if (n != sizeof(expirations))
-			return 0;   // timer did not fire
-		*/
-
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
-
-		// Track expected timing
-		static uint64_t tick_count = 0;
-		static uint64_t start_ns = 0;
-
-		if (tick_count == 0) {
-			// First activation establishes start time
-    		start_ns = vtimer_start_ns;
-		}
-		
-		uint64_t expected_ns = start_ns + tick_count * interval_ns;
-		tick_count += expirations;
-
-		late = now_ns - expected_ns;
-	}
-
-	else if (usepolling) {
-		struct timespec ts;
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-		if (now >= next_frame_time) {
-			late = now - next_frame_time;
-			next_frame_time = now + pcurrent_video_info->vtime * 10ull;
-		}
-	}
-	
-	/*
-	else {
-		uint64_t expirations;
-		ssize_t n = read(timerfd, &expirations, sizeof(expirations));
-		struct timespec now;
-
-		if (n != sizeof(expirations))
-			return 0;   // timer did not fire
-
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
-
-		// Track expected timing
-		static uint64_t tick_count = 0;
-		static uint64_t start_ns = 0;
-
-		if (tick_count == 0) {
-			// First activation establishes start time
-    		start_ns = vtimer_start_ns;
-		}
-		
-		uint64_t expected_ns = start_ns + tick_count * interval_ns;
-		tick_count += expirations;
-
-		late = now_ns - expected_ns;
-	}*/
-	return late;
-}
-
-/************* END AUTOFIRE TIMER STUFF ****************/
-
 
 int input_poll(int getchar)
 {
@@ -6093,8 +5874,8 @@ int input_poll(int getchar)
  	if (!autofire_cfg_parsed) parse_autofire_cfg();
 	static uint64_t joy_prev[NUMPLAYERS] = {};
 	
-	if (timer_started) vrefresh_changed(); // restart timers if vrefresh has changed;
-	if (!timer_started) timer_started = init_timer();
+	force_init_autofire_mask();
+	autofire_timer(); // see autofire.cpp
 
 	int ret = input_test(getchar);
 	if (getchar) return ret;
@@ -6130,36 +5911,6 @@ int input_poll(int getchar)
 
 	if (grabbed)
 	{
-		if (timer_started)
-			new_frame = check_vtimer(pcurrent_video_info->vtime * 10ull);
-		
-#define BENCHMARKAF
-#ifdef BENCHMARKAF
-		static uint64_t late_times[1024];
-		static int num_times = 0;
-
-		if (new_frame)
-			late_times[num_times++] = new_frame;
-
-		if (num_times >= 1024) {
-			uint64_t sum = 0;
-			for (int i = 0; i < 1024; i++)
-				sum += late_times[i];
-			//double average = sum / num_times;
-			uint64_t interval_ns = pcurrent_video_info->vtime * 10ull;
-			float hz = 1e9f / interval_ns;
-			double sd_ns = compute_stddev(late_times, num_times);
-			double sd_us = sd_ns / 1000.0;
-			double sd_ms = sd_ns / 1e6;
-			double frame_ns = 1e9f / hz;
-			double pct = (sd_ns / frame_ns) * 100.0;
-
-			printf("jitter stddev over %d frames: %.0f ns (%.2f us, %.4f ms, %.3f%% of %.2fhz frame)\n",
-       			num_times, sd_ns, sd_us, sd_ms, pct, hz);
-			num_times = 0;
-		}
-#endif // BENCHMARKAF
-
 		for (int i = 0; i < NUMPLAYERS; i++) {
 			bool send = false;
 			if (new_frame) {
