@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 #include <math.h>
+#include <time.h>
 
 #include "input.h"
 #include "user_io.h"
@@ -1863,25 +1864,32 @@ static int get_autofire_code_idx(int player, int code) {
 }
 
 // set to non-zero value to enable autofire
-// TODO currently overflows MAX_AF_CODES -- fix
+// index 0 == autofire disabled.
+// index >0 == matching rate in af_ arrays.
 void set_autofire_code(int player, int code, uint32_t mask, int index)
 {
+	bool found = false;
 	for (int i = 0; i != autofiretable[player].count; i++) {
-		bool found = false;
 		if (autofiretable[player].autofirecodes[i] == code) {
 			found = true;
 		}
-		if (!found) autofiretable[player].autofirecodes[autofiretable[player].count++] = code;
+	}
+	if (!found && autofiretable[player].count < MAX_AF_CODES) {
+		autofiretable[player].autofirecodes[autofiretable[player].count++] = code;
+		found = true;
+	}
+	if (found) {
 		autofiretable[player].index[code] = index;
 		autofiretable[player].mask[code] = mask;
 		autofiretable[player].frame_count[code] = 0;
 	}
+	else return;
 }
 
 void inc_autofire_code(int player, uint32_t code, uint32_t mask)
 {
 	int index = get_autofire_code_idx(player, code) + 1;
-	if (index >= num_af_rates) index = 0;
+	if (index >= num_af_rates || index < 0) index = 0;
 	set_autofire_code(player, code, mask, index);
 }
 
@@ -1892,13 +1900,13 @@ static bool autofire_cfg_parsed = false;
 static int af_cycle_mask[MAX_AF_RATES]; 		// bitmask indicating button press/release per frame
 static int af_cycle_length[MAX_AF_RATES];  		// number of frames before pattern repeats
 static float af_rate_hz[MAX_AF_RATES];	  		// target autofire rate in hz
-static uint32_t autofire_mask[NUMPLAYERS];		// which buttons to toggle this frame
-static uint32_t prev_autofire_mask[NUMPLAYERS];
+static uint32_t autofire_mask[NUMPLAYERS];		// which buttons to toggle this frame iff the matching bit in joy[] is 1 (held)
 
 void parse_autofire_cfg();
 
 static int ref_count[NUMPLAYERS][NUMBUTTONS] = {}; // track multiple codes that represent same mask
 static int key_state[NUMPLAYERS][KEY_MAX] = {};
+
 static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int bnum, int dont_save = 0)
 {
 	static char str[512];
@@ -1927,25 +1935,21 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 			}
 			else
 			{
-				printf("lastmask lastcode %d %d\n", lastmask[num], lastcode[num]);
 				if (!user_io_osd_is_visible() && press && !cfg.disable_autofire)
 				{
-					if (lastcode[num] && lastmask[num])
+					if ((lastcode[num] && lastmask[num] && (lastmask[num] & 0xF) == 0)) // don't allow enabling autofire on directions
+					//if (lastcode[num] && lastmask[num])
 					{
-						// current codepath wouldn't let more than one button come in via the mask
-						// but futureproofing just in case it happens
 						inc_autofire_code(num, lastcode[num], lastmask[num]);
 						if (hasAPI1_5()) {
 							char *strat = str;
-							uint32_t idx = get_autofire_code_idx(num, lastcode[num]);
-							float rate = af_rate_hz[idx];
-							printf("mask: %d\n", af_cycle_mask[idx]);
-							printf("length: %d\n", af_cycle_length[idx]);
-
+							uint32_t af_idx = get_autofire_code_idx(num, lastcode[num]);
+							float rate = af_rate_hz[af_idx];
+							
 							// PSX buttons have very long names
 							// display this on two lines so nothing gets cropped
 							//strat += sprintf(strat, "%s", joy_bnames[btn-4]);
-							strat += sprintf(strat, "Button %d:\n", lastcode[num]);
+							strat += sprintf(strat, "Button %d, Mask %d:\n", lastcode[num], lastmask[num]);
 
 							if (rate == 0.0f) {
 									strat += sprintf(strat, "Autofire disabled");
@@ -2175,9 +2179,9 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 					key_state[num][code] = 1;
 					ref_count[num][btn]++;
 				}
-				else if (key_state[num][code] == 1) {
+				else if (!press && key_state[num][code] == 1) {
 					key_state[num][code] = 0;
-					ref_count[num][btn]--;
+					if (ref_count[num][btn] > 0) ref_count[num][btn]--;
 				}
 				if (ref_count[num][btn]) joy[num] |= bitmask;
 				else joy[num] &= ~bitmask;
@@ -3348,7 +3352,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 						if (ev->code == (input[dev].map[i] & 0xFFFF) || ev->code == (input[dev].map[i] >> 16)) {
 						//if (ev->code == (input[dev].map[i] & 0xFFFF)) mask = (uint64_t)1 << i;
 						//else if (ev->code == (input[dev].map[i] >> 16)) mask = (uint64_t)1 << (i + 32); // 1 is uint32_t. i spent hours realizing this.
-						if (i <= 3 && origcode == ev->code) origcode = 0; // prevent autofire for original dpad
+						//if (i <= 3 && origcode == ev->code) origcode = 0; // prevent autofire for original dpad
 						if (ev->value <= 1) joy_digital(input[dev].num, 1 << i, origcode, ev->value, i, (ev->code == input[dev].mmap[SYS_BTN_OSD_KTGL + 1] || ev->code == input[dev].mmap[SYS_BTN_OSD_KTGL + 2]));
 						// support 2 simultaneous functions for 1 button if defined in 2 sets. No return.
 						}
@@ -5827,18 +5831,6 @@ int input_test(int getchar)
 	return 0;
 }
 
-inline void force_init_autofire_mask() {
-	// if for some reason out autofire timer breaks, that'll mess up regular inputs as well (I think)
-	// so we force our autofire mask to all 1's for each player so at least regular buttons will work
-	static bool autofire_initialized = false;
-	if (!autofire_initialized) {
-		for (int i = 0; i != NUMPLAYERS; i++) {
-			autofire_mask[i] = 0xFFFFFFFF;
-		}
-		autofire_initialized = true;
-	}
-}
-
 int input_poll(int getchar)
 {
 	PROFILE_FUNCTION();
@@ -5882,8 +5874,12 @@ int input_poll(int getchar)
 
 	if (grabbed)
 	{
-		force_init_autofire_mask();
+		// the autofire mask is used to toggle whether button presses are sent are not
+		// so we initialize to "on" for all buttons so we don't have to explicitly
+		// set any that don't have autofire.
+		
 		if (FRAME_TICK(last_frame_count)) {
+			
 			for (int i = 0; i < NUMPLAYERS; i++) {
 			/*
 			new autofire
@@ -5896,12 +5892,12 @@ int input_poll(int getchar)
 			of 1. this keeps us from having to actually care if autofire is enabled or
 			not for each button and use the same logic in either case
 			*/
-			prev_autofire_mask[i] = autofire_mask[i];
-			autofire_mask[i] = 0xF;
 			
+			autofire_mask[i] = 0xFFFFFFFF;
+
 			for (int j = 0; j != autofiretable[i].count; j++) {
 				int code = autofiretable[i].autofirecodes[j];
-				if (key_state[code] && get_autofire_code_idx(i, code)) {  // does this physical key have autofire enabled?
+				if (key_state[i][code] && get_autofire_code_idx(i, code)) {  // does this physical key have autofire enabled?
 						uint8_t rate_idx = autofiretable[i].index[code];
 						uint8_t frame = autofiretable[i].frame_count[code];
 						uint32_t mask = autofiretable[i].mask[code];
@@ -5909,12 +5905,12 @@ int input_poll(int getchar)
 						while (m) {
 							int bit_index = __builtin_ctz(m);   // index of lowest set bit
 							uint32_t bit = (af_cycle_mask[rate_idx] >> frame) & 1u;
-							autofire_mask[i] = (autofire_mask[i] | bit << bit_index);
-							m &= (m - 1);  // clear lowest set bit
+							if (ref_count[i][bit_index] == 1) autofire_mask[i] = (autofire_mask[i] & ~(bit << bit_index));
+							m &= (m - 1);
 						}
 						if (++autofiretable[i].frame_count[code] >= af_cycle_length[rate_idx])
 								autofiretable[i].frame_count[code] = 0;
-					} //else autofire_mask[i] = (autofire_mask[i] | autofiretable[i].mask[code]);
+					}
 				}
 			}
 		}
