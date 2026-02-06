@@ -14,6 +14,12 @@
 #define OSD_ARROW_LEFT   1
 #define OSD_ARROW_RIGHT  2
 
+// PSX Controller Button Glyphs
+#define GLYPH_PSX_TRIANGLE  0x97
+#define GLYPH_PSX_CIRCLE    0x98
+#define GLYPH_PSX_CROSS     0x99
+#define GLYPH_PSX_SQUARE    0x9A
+
 /*functions*/
 void OsdSetTitle(const char *s, int arrow = 0);	// arrow > 0 = display right arrow in bottom right, < 0 = display left arrow
 void OsdSetArrow(int arrow);

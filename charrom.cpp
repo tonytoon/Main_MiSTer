@@ -170,6 +170,12 @@ unsigned char charfont[256][8] =
 	{ 0x2A,0x7F,0x79,0x79,0x79,0x7F,0x2A,0x00 },         // 148  [0x94] mem64
 	{ 0x2A,0x7F,0x7F,0x7F,0x7F,0x7F,0x2A,0x00 },         // 149  [0x95] mem128
 	{ 0x10,0x30,0x60,0x70,0x3C,0x0F,0x03,0x00 },         // 150  [0x96] Mark sign
+
+	//playstation controller button glyphs (transposed to column-major format)
+	{ 0x00,0x70,0x4C,0x42,0x41,0x42,0x4C,0x70 },		 // 151  [0x97] PSX triangle
+	{ 0x00,0x1C,0x22,0x41,0x41,0x41,0x22,0x1C },		 // 152  [0x98] PSX circle
+	{ 0x00,0x42,0x24,0x18,0x18,0x18,0x24,0x42 },		 // 153  [0x99] PSX cross
+	{ 0x00,0x7F,0x41,0x41,0x41,0x41,0x41,0x7F },		 // 154  [0x9A] PSX square
 };
 
 static unsigned char tempfont[2048];
@@ -196,20 +202,37 @@ void LoadFont(char* name)
 
 	for (int pos = start; pos < sz; pos += 8)
 	{
-		int n = 0;
-		for (int i = 128; i != 0; i >>= 1)
+		// check if glyph data is all zeros
+		bool is_empty = true;
+		for (int j = 0; j < 8; j++)
 		{
-			unsigned char b = 0;
-			if (tempfont[pos + 0] & i) b |= 1;
-			if (tempfont[pos + 1] & i) b |= 2;
-			if (tempfont[pos + 2] & i) b |= 4;
-			if (tempfont[pos + 3] & i) b |= 8;
-			if (tempfont[pos + 4] & i) b |= 16;
-			if (tempfont[pos + 5] & i) b |= 32;
-			if (tempfont[pos + 6] & i) b |= 64;
-			if (tempfont[pos + 7] & i) b |= 128;
+			if (tempfont[pos + j] != 0)
+			{
+				is_empty = false;
+				break;
+			}
+		}
 
-			charfont[ch][n++] = b;
+		// only process if the glyph has data
+		// this will leave original charrom entries intact if 
+		// a custom .pf file doesn't define them
+		if (!is_empty)
+		{
+			int n = 0;
+			for (int i = 128; i != 0; i >>= 1)
+			{
+				unsigned char b = 0;
+				if (tempfont[pos + 0] & i) b |= 1;
+				if (tempfont[pos + 1] & i) b |= 2;
+				if (tempfont[pos + 2] & i) b |= 4;
+				if (tempfont[pos + 3] & i) b |= 8;
+				if (tempfont[pos + 4] & i) b |= 16;
+				if (tempfont[pos + 5] & i) b |= 32;
+				if (tempfont[pos + 6] & i) b |= 64;
+				if (tempfont[pos + 7] & i) b |= 128;
+
+				charfont[ch][n++] = b;
+			}
 		}
 
 		ch++;
