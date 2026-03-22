@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <math.h>
+#include <time.h>
 
 #include "hardware.h"
 #include "user_io.h"
@@ -1128,9 +1129,16 @@ static void hdmi_packet_enable(uint8_t mask, bool enable)
 
 static void hdmi_packet_set_data(uint8_t mask, uint8_t offset, uint8_t *data, int size)
 {
+	//struct timespec start, end;
+	//clock_gettime(CLOCK_MONOTONIC, &start);
+	//printf("[TIMING] Enter hdmi_packet_set_data at %ld.%09ld\n", start.tv_sec, start.tv_nsec);
+
 	if (!data)
 	{
 		hdmi_packet_enable(mask, 0);
+		//clock_gettime(CLOCK_MONOTONIC, &end);
+		//double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+		//printf("[TIMING] Exit hdmi_packet_set_data at %ld.%09ld (elapsed: %.6f s)\n", end.tv_sec, end.tv_nsec, elapsed);
 		return;
 	}
 
@@ -1147,10 +1155,10 @@ static void hdmi_packet_set_data(uint8_t mask, uint8_t offset, uint8_t *data, in
 		}
 		else
 		{
-			for (int i = 0; i < size; i++)
+			res = i2c_smbus_write_block_data(fd, offset, size, data);
+			if (res < 0)
 			{
-				res = i2c_smbus_write_byte_data(fd, offset + i, data[i]);
-				if (res < 0) printf("i2c: SPD register write error (%02X %02x): %d\n", offset + i, data[i], res);
+				printf("i2c: packet block write error (%02X len=%d): %d\n", offset, size, res);
 			}
 
 			res = i2c_smbus_write_byte_data(fd, offset + 0x1F, 0x00);
@@ -1162,11 +1170,38 @@ static void hdmi_packet_set_data(uint8_t mask, uint8_t offset, uint8_t *data, in
 	{
 		hdmi_packet_enable(mask, 0);
 	}
+
+	//clock_gettime(CLOCK_MONOTONIC, &end);
+	//double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	//printf("[TIMING] Exit hdmi_packet_set_data at %ld.%09ld (elapsed: %.6f s)\n", end.tv_sec, end.tv_nsec, elapsed);
 }
 
-#define hdmi_spd_config(data) hdmi_packet_set_data(0x40, 0x00, data, sizeof(data))
+static void hdmi_packet_set_data_async(uint8_t mask, uint8_t offset, const uint8_t *data, int size)
+{
+    if (!data) {
+        offload_add_work([=]() {
+            hdmi_packet_set_data(mask, offset, NULL, 0);
+        });
+        return;
+    }
 
-#define hdmi_spare_config(packet, data) hdmi_packet_set_data(packet == 0 ? 0x01 : 0x02, packet == 0 ? 0xC0 : 0xE0, data, sizeof(data))
+    uint8_t *copy = (uint8_t *)malloc(size);
+    if (!copy) {
+        printf("hdmi: failed to allocate async packet buffer\n");
+        return;
+    }
+
+    memcpy(copy, data, size);
+
+    offload_add_work([=]() {
+        hdmi_packet_set_data(mask, offset, copy, size);
+        free(copy);
+    });
+}
+
+#define hdmi_spd_config(data) hdmi_packet_set_data_async(0x40, 0x00, data, sizeof(data))
+
+#define hdmi_spare_config(packet, data) hdmi_packet_set_data_async(packet == 0 ? 0x01 : 0x02, packet == 0 ? 0xC0 : 0xE0, data, sizeof(data))
 
 static void hdmi_config_set_csc()
 {
